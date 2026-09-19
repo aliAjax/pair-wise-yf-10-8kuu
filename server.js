@@ -1,60 +1,8 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { makeId, readDb, writeDb } = require("./lib/db-store");
+const correction = require("./lib/correction-service");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  tunes: [
-    {
-      id: "tune_demo",
-      title: "雨后圆舞曲",
-      composer: "匿名",
-      stripSpec: {
-        widthMm: 70,
-        scale: "20音",
-        tempoBpm: 82,
-        paperType: "半透明纸带"
-      },
-      createdAt: new Date().toISOString()
-    }
-  ],
-  sections: [
-    {
-      id: "section_demo_1",
-      tuneId: "tune_demo",
-      startBeat: 1,
-      endBeat: 32,
-      laneRange: "1-10",
-      checked: true,
-      note: "开头主题已试奏"
-    },
-    {
-      id: "section_demo_2",
-      tuneId: "tune_demo",
-      startBeat: 33,
-      endBeat: 64,
-      laneRange: "4-18",
-      checked: false,
-      note: "副歌段等待校对"
-    }
-  ],
-  issues: [
-    {
-      id: "issue_demo",
-      tuneId: "tune_demo",
-      sectionId: "section_demo_2",
-      type: "漏孔",
-      beat: 41,
-      lane: 12,
-      description: "第41拍高音孔漏打",
-      status: "open",
-      createdAt: new Date().toISOString(),
-      resolvedAt: null
-    }
-  ]
-};
 
 const routes = [
   "GET /health",
@@ -64,29 +12,14 @@ const routes = [
   "GET /tunes/:id/sections",
   "POST /tunes/:id/sections",
   "GET /tunes/:id/unchecked-sections",
+  "GET /tunes/:id/correction-batches",
+  "POST /tunes/:id/correction-batches",
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /correction-requests/:requestId"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -109,10 +42,6 @@ async function parseBody(req) {
     error.status = 400;
     throw error;
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function required(body, fields) {
@@ -148,6 +77,43 @@ function buildProgress(db, tuneId) {
     openIssues,
     resolvedIssues: issues.length - openIssues,
     percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
+  };
+}
+
+function validateBatchBody(body) {
+  required(body, ["requestId", "issueIds", "beatOffset", "laneOffset"]);
+  if (typeof body.requestId !== "string" || !body.requestId.trim()) {
+    const error = new Error("requestId 必须是非空字符串");
+    error.status = 400;
+    throw error;
+  }
+  if (!Array.isArray(body.issueIds) || !body.issueIds.length) {
+    const error = new Error("issueIds 必须是非空数组");
+    error.status = 400;
+    throw error;
+  }
+  if (body.issueIds.some((id) => typeof id !== "string")) {
+    const error = new Error("issueIds 中的元素必须是问题ID字符串");
+    error.status = 400;
+    throw error;
+  }
+  if (new Set(body.issueIds).size !== body.issueIds.length) {
+    const error = new Error("同一问题不能在校正批次中重复选择");
+    error.status = 400;
+    throw error;
+  }
+  const beatOffset = Number(body.beatOffset);
+  const laneOffset = Number(body.laneOffset);
+  if (!Number.isInteger(beatOffset) || !Number.isInteger(laneOffset)) {
+    const error = new Error("拍号偏移和轨道偏移必须为整数");
+    error.status = 400;
+    throw error;
+  }
+  return {
+    requestId: body.requestId.trim(),
+    issueIds: body.issueIds,
+    beatOffset,
+    laneOffset
   };
 }
 
@@ -215,6 +181,57 @@ async function handle(req, res) {
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
+  }
+
+  const correctionBatchesMatch = pathname.match(/^\/tunes\/([^/]+)\/correction-batches$/);
+  if (correctionBatchesMatch && req.method === "GET") {
+    const tuneId = correctionBatchesMatch[1];
+    findTune(db, tuneId);
+    return send(res, 200, { data: correction.listBatches(db, tuneId) });
+  }
+
+  if (correctionBatchesMatch && req.method === "POST") {
+    const tuneId = correctionBatchesMatch[1];
+    findTune(db, tuneId);
+    const body = await parseBody(req);
+
+    // 幂等优先：requestId 已出现过就原样重放首次结果（成功或 409），
+    // 即使本次请求体不合法也不影响首次结论；记录已落盘，重启后仍可追溯
+    if (typeof body.requestId === "string" && body.requestId.trim()) {
+      const previous = correction.findRequest(db, body.requestId.trim());
+      if (previous) return send(res, previous.status, previous.body);
+    }
+
+    const payload = validateBatchBody(body);
+
+    const plan = correction.planBatch(db, tuneId, payload.issueIds, payload.beatOffset, payload.laneOffset);
+    if (!plan.ok) {
+      const errorBody = {
+        error: "校正批次存在冲突，整批未执行",
+        conflicts: plan.conflicts
+      };
+      correction.recordRequest(db, payload, 409, errorBody);
+      await writeDb(db);
+      return send(res, 409, errorBody);
+    }
+
+    const batch = correction.applyBatch(db, { ...payload, tuneId, moves: plan.moves });
+    const data = {
+      batch,
+      issues: plan.moves.map((move) =>
+        db.issues.find((item) => item.id === move.issue.id)
+      )
+    };
+    correction.recordRequest(db, payload, 200, { data });
+    await writeDb(db);
+    return send(res, 200, { data });
+  }
+
+  const correctionRequestMatch = pathname.match(/^\/correction-requests\/([^/]+)$/);
+  if (correctionRequestMatch && req.method === "GET") {
+    const record = correction.findRequest(db, decodeURIComponent(correctionRequestMatch[1]));
+    if (!record) return send(res, 404, { error: "校正请求不存在" });
+    return send(res, record.status, record.body);
   }
 
   const checkMatch = pathname.match(/^\/sections\/([^/]+)\/check$/);
