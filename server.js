@@ -1,60 +1,13 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, writeDb } = require("./lib/db");
+const {
+  makeId,
+  BadRequestError,
+  ConflictError,
+  applyCorrection
+} = require("./lib/correction");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  tunes: [
-    {
-      id: "tune_demo",
-      title: "雨后圆舞曲",
-      composer: "匿名",
-      stripSpec: {
-        widthMm: 70,
-        scale: "20音",
-        tempoBpm: 82,
-        paperType: "半透明纸带"
-      },
-      createdAt: new Date().toISOString()
-    }
-  ],
-  sections: [
-    {
-      id: "section_demo_1",
-      tuneId: "tune_demo",
-      startBeat: 1,
-      endBeat: 32,
-      laneRange: "1-10",
-      checked: true,
-      note: "开头主题已试奏"
-    },
-    {
-      id: "section_demo_2",
-      tuneId: "tune_demo",
-      startBeat: 33,
-      endBeat: 64,
-      laneRange: "4-18",
-      checked: false,
-      note: "副歌段等待校对"
-    }
-  ],
-  issues: [
-    {
-      id: "issue_demo",
-      tuneId: "tune_demo",
-      sectionId: "section_demo_2",
-      type: "漏孔",
-      beat: 41,
-      lane: 12,
-      description: "第41拍高音孔漏打",
-      status: "open",
-      createdAt: new Date().toISOString(),
-      resolvedAt: null
-    }
-  ]
-};
 
 const routes = [
   "GET /health",
@@ -64,29 +17,13 @@ const routes = [
   "GET /tunes/:id/sections",
   "POST /tunes/:id/sections",
   "GET /tunes/:id/unchecked-sections",
+  "GET /tunes/:id/corrections",
+  "POST /tunes/:id/corrections",
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
   "PATCH /issues/:id/status"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -105,22 +42,14 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw new BadRequestError("请求体必须是合法JSON");
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
   if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
+    throw new BadRequestError(`缺少字段：${missing.join(", ")}`);
   }
 }
 
@@ -212,6 +141,76 @@ async function handle(req, res) {
     return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
   }
 
+  const correctionsMatch = pathname.match(/^\/tunes\/([^/]+)\/corrections$/);
+  if (correctionsMatch && req.method === "GET") {
+    const tuneId = correctionsMatch[1];
+    findTune(db, tuneId);
+    const data = db.correctionBatches.filter((item) => item.tuneId === tuneId);
+    return send(res, 200, { data });
+  }
+
+  if (correctionsMatch && req.method === "POST") {
+    const tuneId = correctionsMatch[1];
+    const body = await parseBody(req);
+
+    required(body, ["requestId", "issueIds", "beatOffset", "laneOffset"]);
+    if (!Array.isArray(body.issueIds) || body.issueIds.length === 0) {
+      throw new BadRequestError("issueIds 必须是非空数组");
+    }
+    const beatOffset = Number(body.beatOffset);
+    const laneOffset = Number(body.laneOffset);
+    if (!Number.isInteger(beatOffset)) {
+      throw new BadRequestError("beatOffset 必须是整数（拍号/轨道按格计）");
+    }
+    if (!Number.isInteger(laneOffset)) {
+      throw new BadRequestError("laneOffset 必须是整数（拍号/轨道按格计）");
+    }
+
+    // 重复请求标识：永远返回首次结果（含首次的 409），记录已落盘，重启后仍可重放
+    const first = db.correctionRequests.find((item) => item.requestId === body.requestId);
+    if (first) {
+      if (first.tuneId !== tuneId) {
+        return send(res, 409, {
+          error: "请求标识已用于其他曲目",
+          requestId: body.requestId
+        });
+      }
+      return send(res, first.response.status, first.response.body);
+    }
+
+    let resultStatus;
+    let resultBody;
+    try {
+      findTune(db, tuneId);
+      const batch = applyCorrection(db, {
+        requestId: body.requestId,
+        tuneId,
+        issueIds: body.issueIds,
+        beatOffset,
+        laneOffset
+      });
+      resultStatus = 201;
+      resultBody = { data: batch };
+    } catch (error) {
+      if (error instanceof ConflictError) {
+        resultStatus = 409;
+        resultBody = { error: error.message, conflicts: error.details };
+      } else {
+        throw error;
+      }
+    }
+
+    // 成功与整批 409 都构成该请求标识的"首次结果"；400/404 不占用标识
+    db.correctionRequests.push({
+      requestId: body.requestId,
+      tuneId,
+      response: { status: resultStatus, body: resultBody },
+      at: new Date().toISOString()
+    });
+    await writeDb(db);
+    return send(res, resultStatus, resultBody);
+  }
+
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
@@ -275,7 +274,10 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) => {
+    const status = error instanceof BadRequestError ? 400 : error.status || 500;
+    send(res, status, { error: error.message || "服务器错误" });
+  });
 });
 
 server.listen(PORT, () => {
